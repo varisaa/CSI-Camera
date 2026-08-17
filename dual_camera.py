@@ -2,8 +2,9 @@
 # Copyright (c) 2019-2022 JetsonHacks
 
 # A simple code snippet
-# Using two  CSI cameras (such as the Raspberry Pi Version 2) connected to a
-# NVIDIA Jetson Nano Developer Kit with two CSI ports (Jetson Nano, Jetson Xavier NX) via OpenCV
+# Using two CSI cameras (such as the Raspberry Pi Version 2) connected to a
+# NVIDIA Jetson Nano Developer Kit with two CSI ports (Jetson Nano, Jetson Xavier NX),
+# plus one USB (UVC) camera, via OpenCV
 # Drivers for the camera and OpenCV are included in the base image in JetPack 4.3+
 
 # This script will open a window and place the camera stream from each camera in a window
@@ -12,6 +13,7 @@
 # is a noticeable lag
 
 import cv2
+import subprocess
 import threading
 import numpy as np
 
@@ -89,15 +91,15 @@ class CSI_Camera:
             self.read_thread.join()
 
 
-""" 
-gstreamer_pipeline returns a GStreamer pipeline for capturing from the CSI camera
+"""
+csi_gstreamer_pipeline returns a GStreamer pipeline for capturing from a CSI camera
 Flip the image by setting the flip_method (most common values: 0 and 2)
 display_width and display_height determine the size of each camera pane in the window on the screen
 Default 1920x1080
 """
 
 
-def gstreamer_pipeline(
+def csi_gstreamer_pipeline(
     sensor_id=0,
     capture_width=1920,
     capture_height=1080,
@@ -125,44 +127,93 @@ def gstreamer_pipeline(
     )
 
 
+"""
+usb_gstreamer_pipeline returns a GStreamer pipeline for capturing from a USB (UVC) camera,
+decoding its MJPG stream at a size that matches the CSI panes.
+"""
+
+
+def usb_gstreamer_pipeline(
+    device="/dev/v4l/by-id/usb-Global_Shutter_Camera_Global_Shutter_Camera_2602040001-video-index0",
+    display_width=640,
+    display_height=480,
+    framerate=30,
+):
+    # 60Hz anti-flicker (US mains) - resets to the driver default (50Hz) on
+    # unplug/reboot, so it needs to be reapplied here every time.
+    subprocess.run(
+        ["v4l2-ctl", "-d", device, "--set-ctrl=power_line_frequency=2"],
+        check=False,
+    )
+    return (
+        "v4l2src device=%s ! "
+        "image/jpeg, width=(int)%d, height=(int)%d, framerate=(fraction)%d/1 ! "
+        "jpegdec ! videoconvert ! "
+        "video/x-raw, format=(string)BGR ! appsink"
+        % (device, display_width, display_height, framerate)
+    )
+
+
 def run_cameras():
-    window_title = "Dual CSI Cameras"
+    window_title = "Trio Cameras"
+
+    # Common per-pane display size so all three panes stack cleanly side by side
+    pane_width = 640
+    pane_height = 480
+
     left_camera = CSI_Camera()
     left_camera.open(
-        gstreamer_pipeline(
+        csi_gstreamer_pipeline(
             sensor_id=0,
             capture_width=1920,
             capture_height=1080,
             flip_method=0,
-            display_width=960,
-            display_height=540,
+            display_width=pane_width,
+            display_height=pane_height,
         )
     )
     left_camera.start()
 
-    right_camera = CSI_Camera()
-    right_camera.open(
-        gstreamer_pipeline(
+    center_camera = CSI_Camera()
+    center_camera.open(
+        csi_gstreamer_pipeline(
             sensor_id=1,
             capture_width=1920,
             capture_height=1080,
             flip_method=0,
-            display_width=960,
-            display_height=540,
+            display_width=pane_width,
+            display_height=pane_height,
+        )
+    )
+    center_camera.start()
+
+    # The USB camera isn't CSI/Argus-based, but CSI_Camera just wraps a GStreamer
+    # pipeline string, so it works fine for a plain v4l2src/UVC pipeline too.
+    right_camera = CSI_Camera()
+    right_camera.open(
+        usb_gstreamer_pipeline(
+            device="/dev/v4l/by-id/usb-Global_Shutter_Camera_Global_Shutter_Camera_2602040001-video-index0",
+            display_width=pane_width,
+            display_height=pane_height,
         )
     )
     right_camera.start()
 
-    if left_camera.video_capture.isOpened() and right_camera.video_capture.isOpened():
+    if (
+        left_camera.video_capture.isOpened()
+        and center_camera.video_capture.isOpened()
+        and right_camera.video_capture.isOpened()
+    ):
 
         cv2.namedWindow(window_title, cv2.WINDOW_AUTOSIZE)
 
         try:
             while True:
                 _, left_image = left_camera.read()
+                _, center_image = center_camera.read()
                 _, right_image = right_camera.read()
                 # Use numpy to place images next to each other
-                camera_images = np.hstack((left_image, right_image)) 
+                camera_images = np.hstack((left_image, center_image, right_image))
                 # Check to see if the user closed the window
                 # Under GTK+ (Jetson Default), WND_PROP_VISIBLE does not work correctly. Under Qt it does
                 # GTK - Substitute WND_PROP_AUTOSIZE to detect if window has been closed by user
@@ -180,13 +231,17 @@ def run_cameras():
 
             left_camera.stop()
             left_camera.release()
+            center_camera.stop()
+            center_camera.release()
             right_camera.stop()
             right_camera.release()
         cv2.destroyAllWindows()
     else:
-        print("Error: Unable to open both cameras")
+        print("Error: Unable to open all three cameras")
         left_camera.stop()
         left_camera.release()
+        center_camera.stop()
+        center_camera.release()
         right_camera.stop()
         right_camera.release()
 
